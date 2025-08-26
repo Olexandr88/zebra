@@ -23,10 +23,11 @@ use zebra_chain::{
 };
 use zebra_node_services::rpc_client::RpcRequestClient;
 use zebra_state::{ChainTipChange, LatestChainTip, MAX_BLOCK_REORG_HEIGHT};
-use zebra_test::command::TestChild;
+use zebra_test::{args, command::TestChild};
 
 use crate::common::{
-    launch::spawn_zebrad_for_rpc,
+    config::testdir,
+    launch::{can_spawn_zebrad_for_test_type, ZebradTestDirExt},
     sync::{check_sync_logs_until, MempoolBehavior, SYNC_FINISHED_REGEX},
     test_type::TestType,
 };
@@ -215,9 +216,34 @@ pub async fn raw_future_blocks(
     );
 
     let should_sync = true;
-    let (zebrad, zebra_rpc_address) =
-        spawn_zebrad_for_rpc(network.clone(), test_name, test_type, should_sync)?
-            .ok_or_else(|| eyre!("raw_future_blocks requires a cached state"))?;
+    // TODO: Add a config param to `spawn_zebrad_for_rpc()` and replace this block with a call to it
+    let (zebrad, zebra_rpc_address) = 'spawn_zebrad_for_rpc: {
+        // Skip the test unless the user specifically asked for it
+        if !can_spawn_zebrad_for_test_type(test_name, test_type, should_sync) {
+            break 'spawn_zebrad_for_rpc None;
+        }
+
+        // Get the zebrad config
+        let mut config = test_type
+            .zebrad_config(test_name, should_sync, None, &network)
+            .expect("already checked config")?;
+        config.state.should_backup_non_finalized_state = false;
+
+        let (zebrad_failure_messages, zebrad_ignore_messages) = test_type.zebrad_failure_messages();
+
+        // Writes a configuration that has RPC listen_addr set (if needed).
+        // If the state path env var is set, uses it in the config.
+        let zebrad = testdir()?
+            .with_exact_config(&config)?
+            .spawn_child(args!["start"])?
+            .bypass_test_capture(true)
+            .with_timeout(test_type.zebrad_timeout())
+            .with_failure_regex_iter(zebrad_failure_messages, zebrad_ignore_messages);
+
+        Some((zebrad, config.rpc.listen_addr))
+    }
+    .ok_or_else(|| eyre!("raw_future_blocks requires a cached state"))?;
+
     let rpc_address = zebra_rpc_address.expect("test type must have RPC port");
 
     let mut zebrad = check_sync_logs_until(
